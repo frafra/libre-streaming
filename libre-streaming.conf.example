@@ -1,0 +1,18 @@
+# adjust this file and rename it as: libre-streaming.conf
+
+[audio]
+# set your microphone level to -micGain (dB)
+micGain = 22
+# local (kbit/s)
+bitrateLocal = 32
+# streaming (kbit/s)
+bitrateShout = 32
+
+[icecast]
+ip = 127.0.0.1
+port = 8000
+password = hackme
+mount = live.ogg
+
+[storage]
+path = ~/live.ogg
