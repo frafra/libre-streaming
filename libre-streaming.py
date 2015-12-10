@@ -18,106 +18,113 @@ Gst.init(sys.argv)
 
 interval = 5
 
-elements = {
-    'pulsesrc':'pulsesrc',
-    'rgvolume':'rgvolume',
-    'rglimiter':'rglimiter',
-    'audioconvert':'audioconvert',
-    'tee':'tee',
-    'opusenc0':'opusenc',
-    'oggmux0':'oggmux',
-    'queue0':'queue',
-    'filesink':'filesink',
-    'opusenc1':'opusenc',
-    'oggmux1':'oggmux',
-    'queue1':'queue',
-    'shout2send':'shout2send',
-}
+class LibreStreaming:
+    def __init__(self, config):
+        micGain = int(config['audio']['micGain'])
+        bitrateLocal = int(config['audio']['bitrateLocal'])
+        bitrateShout = int(config['audio']['bitrateShout'])
+        path = os.path.expanduser(config['storage']['path'])
+        icecast = dict(config['icecast'])
+        icecast['port'] = int(icecast['port'])
 
-def event_probe2(pad, info, *args):
-    Gst.Pad.remove_probe(pad, info.id)
-    tee.link(opusenc1)
-    opusenc1.set_state(Gst.State.PLAYING)
-    oggmux1.set_state(Gst.State.PLAYING)
-    queue1.set_state(Gst.State.PLAYING)
-    shout2send.set_state(Gst.State.PLAYING)
-    return Gst.PadProbeReturn.OK
+        elements = [
+            ['pulsesrc', {}],
+            ['rgvolume', {'pre-amp':micGain+6, 'headroom':micGain+10}],
+            ['rglimiter', {}],
+            ['audioconvert', {}],
+            ['tee', {}],
+            # tee src_0
+            ['opusenc', {'bitrate':bitrateLocal*1024}],
+            ['oggmux', {}],
+            ['queue', {}],
+            ['filesink', {'location':path}],
+            # tee src_1
+            ['opusenc', {'bitrate':bitrateShout*1024}],
+            ['oggmux', {}],
+            ['queue', {}],
+            ['shout2send', icecast],
+        ]
 
-def reconnect():
-    pad = tee.get_static_pad('src_1')
-    pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, event_probe2, None)
+        self.pipeline = Gst.Pipeline()
+        message_bus = self.pipeline.get_bus()
+        message_bus.add_signal_watch()
+        message_bus.connect('message', self.messageHandler)
 
-def event_probe(pad, info, *args):
-    Gst.Pad.remove_probe(pad, info.id)
-    tee.unlink(opusenc1)
-    opusenc1.set_state(Gst.State.NULL)
-    oggmux1.set_state(Gst.State.NULL)
-    queue1.set_state(Gst.State.NULL)
-    shout2send.set_state(Gst.State.NULL)
-    GLib.timeout_add_seconds(interval, reconnect)
-    return Gst.PadProbeReturn.OK
+        for kind, attrs in elements:
+            i = sum(map(lambda v: v.startswith(kind), vars(self)))
+            name = kind+str(i)
+            vars(self)[name] = Gst.ElementFactory.make(kind, name)
+            for key, value in attrs.items():
+                vars(self)[name].set_property(key, value)
+            self.pipeline.add(vars(self)[name])
 
-def message_handler(bus, message):
-    if message.type == Gst.MessageType.ERROR:
-        if message.src == shout2send:
-            pad = tee.get_static_pad('src_1')
-            pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, event_probe, None)
-        else:
-            print(message.parse_error())
-            pipeline.set_state(Gst.State.NULL)
-            exit(1)
+        # Linking
+        pulsesrc0_caps = Gst.Caps.from_string('audio/x-raw,channels=1')
+        self.pulsesrc0.link_filtered(self.rgvolume0, pulsesrc0_caps)
+        self.subpipelines = [
+            [self.rgvolume0, self.rglimiter0,
+                self.audioconvert0, self.tee0],
+            [self.tee0, self.opusenc0, self.oggmux0,
+                self.queue0, self.filesink0],
+            [self.tee0, self.opusenc1, self.oggmux1,
+                self.queue1, self.shout2send0],
+        ]
+        for subpipeline in self.subpipelines:
+            for prev, next in zip(subpipeline, subpipeline[1:]):
+                prev.link(next)
 
-def main():
+    def setState(self, state, *elements):
+        for element in elements:
+            element.set_state(state)
+
+    def shout2sendReconnect(self, pad, info):
+        Gst.Pad.remove_probe(pad, info.id)
+        self.tee0.link(self.opusenc1)
+        self.setState(Gst.State.PLAYING, *self.subpipelines[2][1:])
+        return Gst.PadProbeReturn.OK
+
+    def shout2sendPreReconnect(self):
+        pad = self.tee0.get_static_pad('src_1')
+        pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, 
+                      self.shout2sendReconnect)
+
+    def shout2sendDown(self, pad, info):
+        Gst.Pad.remove_probe(pad, info.id)
+        self.tee0.unlink(self.opusenc1)
+        self.setState(Gst.State.NULL, *self.subpipelines[2][1:])
+        GLib.timeout_add_seconds(interval, self.shout2sendPreReconnect)
+        return Gst.PadProbeReturn.OK
+
+    def messageHandler(self, bus, message):
+        if message.type == Gst.MessageType.ERROR:
+            if message.src == self.shout2send0:
+                pad = self.tee0.get_static_pad('src_1')
+                pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM,
+                               self.shout2sendDown)
+            else:
+                print(message.parse_error())
+                self.pipeline.set_state(Gst.State.NULL)
+                exit(1)
+
+    def play(self):
+        self.pipeline.set_state(Gst.State.PLAYING)
+        loop = GLib.MainLoop()
+        try:
+            loop.run()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.pipeline.send_event(Gst.Event.new_eos())
+            time.sleep(1)
+            self.pipeline.set_state(Gst.State.NULL)
+
+def main(filename='libre-streaming.conf'):
     config = configparser.ConfigParser()
-    config.read('libre-streaming.conf')
-
-    pipeline = Gst.Pipeline()
-    message_bus = pipeline.get_bus()
-    message_bus.add_signal_watch()
-    message_bus.connect('message', message_handler)
-
-    for name, kind in elements.items():
-        globals()[name] = Gst.ElementFactory.make(kind, name)
-        pipeline.add(globals()[name])
-
-    path = os.path.expanduser(config['storage']['path'])
-
-    pulsesrc_caps = Gst.Caps.from_string('audio/x-raw,channels=1')
-    rgvolume.set_property('pre-amp', int(config['audio']['micGain'])+6)
-    rgvolume.set_property('headroom', int(config['audio']['micGain'])+10)
-    opusenc0.set_property('bitrate', int(config['audio']['bitrateLocal'])*1024)
-    opusenc1.set_property('bitrate', int(config['audio']['bitrateShout'])*1024)
-    filesink.set_property('location', path)
-    shout2send.set_property('ip', config['icecast']['ip'])
-    shout2send.set_property('port', int(config['icecast']['port']))
-    shout2send.set_property('password', config['icecast']['password'])
-    shout2send.set_property('mount', config['icecast']['mount'])
-
-    pulsesrc.link_filtered(rgvolume, pulsesrc_caps)
-    rgvolume.link(rglimiter)
-    rglimiter.link(audioconvert)
-    audioconvert.link(tee)
-
-    tee.link(opusenc0)
-    opusenc0.link(oggmux0)
-    oggmux0.link(queue0)
-    queue0.link(filesink)
-
-    tee.link(opusenc1)
-    opusenc1.link(oggmux1)
-    oggmux1.link(queue1)
-    queue1.link(shout2send)
-
-    pipeline.set_state(Gst.State.PLAYING)
-    loop = GLib.MainLoop()
-    try:
-        loop.run()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        pipeline.send_event(Gst.Event.new_eos())
-        time.sleep(1)
-        pipeline.set_state(Gst.State.NULL)
+    if not config.read(filename):
+        print("Unable to read %s" % filename)
+        exit(1)
+    libreStreaming = LibreStreaming(config)
+    libreStreaming.play()
 
 if __name__ == '__main__':
     main()
