@@ -121,7 +121,7 @@ class LibreStreaming:
 def main(filename='libre-streaming.conf'):
     config = configparser.ConfigParser()
     if not config.read(filename):
-        print("Unable to read %s" % filename)
+        print("Unable to read {0!s}".format(filename))
         exit(1)
     libreStreaming = LibreStreaming(config)
     libreStreaming.play()
